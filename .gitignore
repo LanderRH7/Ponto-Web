@@ -1,18 +1,609 @@
-# This .gitignore is appropriate for repositories deployed to GitHub Pages and using
-# a Gemfile as specified at https://github.com/github/pages-gem#conventional
+import React, { useEffect, useMemo, useState } from "react";
+import { motion } from "framer-motion";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Download, LogIn, LogOut, PlusCircle, Trash2, Users } from "lucide-react";
 
-# Basic Jekyll gitignores (synchronize to Jekyll.gitignore)
-_site/
-.sass-cache/
-.jekyll-cache/
-.jekyll-metadata
+/**
+ * Sistema de Ponto Web — Protótipo
+ * - Login por usuário + PIN (sem backend) — guarda em localStorage
+ * - Registro de ponto: Entrada / Saída
+ * - Cálculo automático de horas por dia
+ * - Histórico por período e exportação CSV
+ * - Área Admin: gestão de colaboradores
+ *
+ * Observação: Este é um protótipo local-first (sem servidor). 
+ * Em produção, basta trocar a camada de storage por Firebase/Supabase.
+ */
 
-# Additional Ruby/bundler ignore for when you run: bundle install
-/vendor
+// ===== Utilitários de data/hora =====
+const TZ = "America/Sao_Paulo";
 
-# Specific ignore for GitHub Pages
-# GitHub Pages will always use its own deployed version of pages-gem 
-# This means GitHub Pages will NOT use your Gemfile.lock and therefore it is
-# counterproductive to check this file into the repository.
-# Details at https://github.com/github/pages-gem/issues/768
-Gemfile.lock
+function fmtDateTime(ts: number) {
+  return new Intl.DateTimeFormat("pt-BR", {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone: TZ,
+  }).format(ts);
+}
+
+function fmtTime(ts: number) {
+  return new Intl.DateTimeFormat("pt-BR", {
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: TZ,
+  }).format(ts);
+}
+
+function yyyyMMdd(ts: number) {
+  const d = new Date(ts);
+  const d2 = new Date(d.toLocaleString("en-US", { timeZone: TZ }));
+  const y = d2.getFullYear();
+  const m = String(d2.getMonth() + 1).padStart(2, "0");
+  const da = String(d2.getDate()).padStart(2, "0");
+  return `${y}-${m}-${da}`;
+}
+
+function msToHHMM(ms: number) {
+  const totalMinutes = Math.floor(ms / 60000);
+  const hh = Math.floor(totalMinutes / 60).toString().padStart(2, "0");
+  const mm = (totalMinutes % 60).toString().padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+// ===== Tipos =====
+export type Role = "admin" | "employee";
+
+export type User = {
+  id: string; // slug
+  name: string;
+  role: Role;
+  pin: string; // simples, para demo
+};
+
+export type Punch = {
+  id: string;
+  userId: string;
+  type: "IN" | "OUT";
+  ts: number; // epoch ms
+};
+
+// ===== Storage Local =====
+const LS_KEYS = {
+  users: "ponto.users.v1",
+  punches: "ponto.punches.v1",
+  session: "ponto.session.v1",
+};
+
+function loadUsers(): User[] {
+  try {
+    return JSON.parse(localStorage.getItem(LS_KEYS.users) || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function saveUsers(users: User[]) {
+  localStorage.setItem(LS_KEYS.users, JSON.stringify(users));
+}
+
+function loadPunches(): Punch[] {
+  try {
+    return JSON.parse(localStorage.getItem(LS_KEYS.punches) || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function savePunches(punches: Punch[]) {
+  localStorage.setItem(LS_KEYS.punches, JSON.stringify(punches));
+}
+
+function loadSession(): { userId: string } | null {
+  try {
+    return JSON.parse(localStorage.getItem(LS_KEYS.session) || "null");
+  } catch {
+    return null;
+  }
+}
+
+function saveSession(s: { userId: string } | null) {
+  if (!s) localStorage.removeItem(LS_KEYS.session);
+  else localStorage.setItem(LS_KEYS.session, JSON.stringify(s));
+}
+
+// ===== Núcleo de Negócio =====
+function calcDailyTotals(punches: Punch[]) {
+  // Ordena por ts e agrupa IN/OUT em pares
+  const sorted = [...punches].sort((a, b) => a.ts - b.ts);
+  let totalMs = 0;
+  for (let i = 0; i < sorted.length; i += 2) {
+    const pin = sorted[i];
+    const pout = sorted[i + 1];
+    if (pin && pin.type === "IN" && pout && pout.type === "OUT") {
+      totalMs += Math.max(0, pout.ts - pin.ts);
+    }
+  }
+  const openStint = sorted.length % 2 === 1 ? sorted[sorted.length - 1] : null;
+  return { totalMs, openStint };
+}
+
+function getUserPunchesForDay(all: Punch[], userId: string, day: string) {
+  return all.filter((p) => p.userId === userId && yyyyMMdd(p.ts) === day);
+}
+
+function exportCSV(rows: string[][], filename = "ponto.csv") {
+  const csv = rows.map((r) => r.map((v) => `"${(v ?? "").replaceAll('"', '""')}"`).join(",")).join("\n");
+  const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ===== Componentes =====
+function useLocalState<T>(key: string, initial: T) {
+  const [state, setState] = useState<T>(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : initial;
+    } catch {
+      return initial;
+    }
+  });
+  useEffect(() => {
+    localStorage.setItem(key, JSON.stringify(state));
+  }, [key, state]);
+  return [state, setState] as const;
+}
+
+function AuthView({ onLogin }: { onLogin: (u: User) => void }) {
+  const [users, setUsers] = useState<User[]>(loadUsers());
+  const [name, setName] = useState("");
+  const [pin, setPin] = useState("");
+
+  useEffect(() => {
+    const stored = loadUsers();
+    if (stored.length === 0) {
+      // cria admin padrão para facilitar o primeiro acesso
+      const admin: User = { id: "admin", name: "Administrador", role: "admin", pin: "1234" };
+      saveUsers([admin]);
+      setUsers([admin]);
+    } else {
+      setUsers(stored);
+    }
+  }, []);
+
+  function handleLogin() {
+    const u = users.find((u) => (u.name === name || u.id === name) && u.pin === pin);
+    if (!u) {
+      alert("Usuário ou PIN inválidos.");
+      return;
+    }
+    onLogin(u);
+  }
+
+  return (
+    <div className="min-h-screen w-full grid place-items-center bg-gradient-to-b from-slate-50 to-white p-4">
+      <Card className="w-full max-w-md shadow-lg">
+        <CardHeader>
+          <CardTitle>Entrar no Sistema de Ponto</CardTitle>
+          <CardDescription>
+            Use <b>Administrador / 1234</b> no primeiro acesso. Depois crie os colaboradores na aba Admin.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="space-y-2">
+            <Label>Usuário (nome ou ID)</Label>
+            <Input placeholder="Administrador" value={name} onChange={(e) => setName(e.target.value)} />
+          </div>
+          <div className="space-y-2">
+            <Label>PIN</Label>
+            <Input placeholder="1234" type="password" value={pin} onChange={(e) => setPin(e.target.value)} />
+          </div>
+        </CardContent>
+        <CardFooter className="flex gap-2">
+          <Button className="w-full" onClick={handleLogin}>
+            <LogIn className="mr-2 h-4 w-4" /> Entrar
+          </Button>
+        </CardFooter>
+      </Card>
+    </div>
+  );
+}
+
+function HeaderBar({ currentUser, onLogout }: { currentUser: User; onLogout: () => void }) {
+  return (
+    <div className="sticky top-0 z-10 backdrop-blur supports-[backdrop-filter]:bg-white/60 bg-white/80 border-b">
+      <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+        <div className="font-semibold text-xl">Ponto • Grupo Mohr</div>
+        <div className="flex items-center gap-3 text-sm">
+          <span className="text-slate-600">{currentUser.name} ({currentUser.role === "admin" ? "Admin" : "Colaborador"})</span>
+          <Button variant="outline" size="sm" onClick={onLogout}>
+            <LogOut className="mr-2 h-4 w-4" /> Sair
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ClockPanel({ user, allPunches, setAllPunches }: { user: User; allPunches: Punch[]; setAllPunches: (p: Punch[]) => void }) {
+  const today = useMemo(() => yyyyMMdd(Date.now()), []);
+  const punchesToday = useMemo(() => getUserPunchesForDay(allPunches, user.id, today), [allPunches, user.id, today]);
+  const { totalMs, openStint } = useMemo(() => calcDailyTotals(punchesToday), [punchesToday]);
+
+  function punch(type: "IN" | "OUT") {
+    const now = Date.now();
+    const p: Punch = { id: crypto.randomUUID(), userId: user.id, type, ts: now };
+    const updated = [...allPunches, p];
+    setAllPunches(updated);
+    savePunches(updated);
+  }
+
+  const canIn = !openStint;
+  const canOut = !!openStint;
+
+  return (
+    <Card className="shadow-md">
+      <CardHeader>
+        <CardTitle>Registrar Ponto</CardTitle>
+        <CardDescription>Hoje: {fmtDateTime(Date.now())}</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="flex gap-3 flex-wrap">
+          <Button disabled={!canIn} onClick={() => punch("IN")}>
+            <PlusCircle className="mr-2 h-4 w-4" /> Entrada
+          </Button>
+          <Button variant="secondary" disabled={!canOut} onClick={() => punch("OUT")}>
+            <LogOut className="mr-2 h-4 w-4" /> Saída
+          </Button>
+        </div>
+        <Separator />
+        <div className="grid md:grid-cols-2 gap-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Status</CardTitle>
+              <CardDescription>Jornada do dia</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="text-4xl font-bold">{msToHHMM(totalMs)}</div>
+              <div className="text-sm text-slate-600 mt-1">
+                {openStint ? (
+                  <span>Em andamento desde {fmtTime(openStint.ts)}</span>
+                ) : (
+                  <span>Sem jornada em aberto</span>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Marcações de hoje</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="space-y-2">
+                {punchesToday.length === 0 && <div className="text-sm text-slate-500">Sem registros hoje.</div>}
+                {punchesToday.map((p) => (
+                  <div key={p.id} className="flex items-center justify-between text-sm border rounded-lg p-2">
+                    <span className="font-medium">{p.type === "IN" ? "Entrada" : "Saída"}</span>
+                    <span>{fmtTime(p.ts)}</span>
+                  </div>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function HistoryPanel({ user, allPunches }: { user: User; allPunches: Punch[] }) {
+  const [from, setFrom] = useState<string>(() => new Date(Date.now() - 13 * 24 * 3600 * 1000).toISOString().slice(0, 10));
+  const [to, setTo] = useState<string>(() => new Date().toISOString().slice(0, 10));
+
+  const days = useMemo(() => {
+    const start = new Date(from);
+    const end = new Date(to);
+    const out: string[] = [];
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`);
+    }
+    return out;
+  }, [from, to]);
+
+  const rows = useMemo(() => {
+    return days.map((day) => {
+      const ps = getUserPunchesForDay(allPunches, user.id, day);
+      const { totalMs } = calcDailyTotals(ps);
+      return { day, total: msToHHMM(totalMs), punches: ps };
+    });
+  }, [days, allPunches, user.id]);
+
+  function handleExport() {
+    const csvRows: string[][] = [["Data", "Tipo", "Horário"], ...rows.flatMap((r) => r.punches.map((p) => [r.day, p.type, fmtTime(p.ts)]))];
+    exportCSV(csvRows, `ponto_${user.id}_${from}_a_${to}.csv`);
+  }
+
+  return (
+    <Card className="shadow-md">
+      <CardHeader>
+        <CardTitle>Histórico</CardTitle>
+        <CardDescription>Filtre por período e exporte em CSV</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid sm:grid-cols-3 gap-3">
+          <div className="space-y-1">
+            <Label>De</Label>
+            <Input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
+          </div>
+          <div className="space-y-1">
+            <Label>Até</Label>
+            <Input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
+          </div>
+          <div className="flex items-end">
+            <Button className="w-full" onClick={handleExport}>
+              <Download className="mr-2 h-4 w-4" /> Exportar CSV
+            </Button>
+          </div>
+        </div>
+        <div className="rounded-xl border overflow-hidden">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Data</TableHead>
+                <TableHead>Marcações</TableHead>
+                <TableHead className="text-right">Total</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((r) => (
+                <TableRow key={r.day}>
+                  <TableCell className="font-medium">{r.day}</TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap gap-2">
+                      {r.punches.map((p) => (
+                        <span key={p.id} className="px-2 py-1 rounded-full text-xs border">
+                          {p.type === "IN" ? "Entrada" : "Saída"} • {fmtTime(p.ts)}
+                        </span>
+                      ))}
+                      {r.punches.length === 0 && <span className="text-xs text-slate-500">—</span>}
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-right font-semibold">{r.total}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function AdminPanel({ currentUser, users, setUsers, punches, setPunches }: { currentUser: User; users: User[]; setUsers: (u: User[]) => void; punches: Punch[]; setPunches: (p: Punch[]) => void }) {
+  const [name, setName] = useState("");
+  const [pin, setPin] = useState("");
+  const [role, setRole] = useState<Role>("employee");
+  const [selectedUser, setSelectedUser] = useState<string>("");
+
+  function addUser() {
+    if (!name || !pin) return alert("Preencha nome e PIN.");
+    const id = name.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
+    if (users.some((u) => u.id === id)) return alert("Já existe um usuário com esse ID gerado.");
+    const u: User = { id, name, role, pin };
+    const updated = [...users, u];
+    setUsers(updated);
+    saveUsers(updated);
+    setName("");
+    setPin("");
+    setRole("employee");
+  }
+
+  function deleteUser(id: string) {
+    if (!confirm("Remover este usuário e seus registros?")) return;
+    const updatedUsers = users.filter((u) => u.id !== id);
+    const updatedPunches = punches.filter((p) => p.userId !== id);
+    setUsers(updatedUsers);
+    setPunches(updatedPunches);
+    saveUsers(updatedUsers);
+    savePunches(updatedPunches);
+  }
+
+  const viewUser = users.find((u) => u.id === (selectedUser || currentUser.id)) || currentUser;
+  const byDay = useMemo(() => {
+    const map: Record<string, Punch[]> = {};
+    punches.filter((p) => p.userId === viewUser.id).forEach((p) => {
+      const d = yyyyMMdd(p.ts);
+      (map[d] ||= []).push(p);
+    });
+    const rows = Object.entries(map)
+      .sort(([a], [b]) => (a < b ? -1 : 1))
+      .map(([day, ps]) => ({ day, ps: ps.sort((a, b) => a.ts - b.ts), totalMs: calcDailyTotals(ps).totalMs }));
+    return rows;
+  }, [punches, viewUser.id]);
+
+  function exportAll() {
+    const rows = [["Usuário", "Nome", "Data", "Tipo", "Horário"] as string[]];
+    users.forEach((u) => {
+      punches
+        .filter((p) => p.userId === u.id)
+        .sort((a, b) => a.ts - b.ts)
+        .forEach((p) => rows.push([u.id, u.name, yyyyMMdd(p.ts), p.type, fmtTime(p.ts)]));
+    });
+    exportCSV(rows, `ponto_todos_${new Date().toISOString().slice(0, 10)}.csv`);
+  }
+
+  return (
+    <Card className="shadow-md">
+      <CardHeader>
+        <CardTitle>Administração</CardTitle>
+        <CardDescription>Gerencie colaboradores e visualize registros</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-6">
+        <div className="grid lg:grid-cols-3 gap-6">
+          <div className="lg:col-span-1 space-y-3">
+            <div className="font-semibold">Novo colaborador</div>
+            <div className="space-y-2">
+              <Label>Nome</Label>
+              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Maria Silva" />
+            </div>
+            <div className="space-y-2">
+              <Label>PIN</Label>
+              <Input value={pin} onChange={(e) => setPin(e.target.value)} placeholder="0000" />
+            </div>
+            <div className="space-y-2">
+              <Label>Perfil</Label>
+              <Select value={role} onValueChange={(v: Role) => setRole(v)}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Selecione" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="employee">Colaborador</SelectItem>
+                  <SelectItem value="admin">Admin</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <Button className="w-full mt-2" onClick={addUser}>
+              <Users className="mr-2 h-4 w-4" /> Adicionar
+            </Button>
+            <Separator className="my-4" />
+            <div className="space-y-2">
+              <Label>Visualizar registros de</Label>
+              <Select value={selectedUser} onValueChange={setSelectedUser}>
+                <SelectTrigger>
+                  <SelectValue placeholder={`${viewUser.name} (${viewUser.id})`} />
+                </SelectTrigger>
+                <SelectContent>
+                  {users.map((u) => (
+                    <SelectItem key={u.id} value={u.id}>{u.name} ({u.id})</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <Button variant="outline" className="w-full mt-2" onClick={exportAll}>
+              <Download className="mr-2 h-4 w-4" /> Exportar CSV (todos)
+            </Button>
+          </div>
+
+          <div className="lg:col-span-2">
+            <div className="rounded-xl border overflow-hidden">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Data</TableHead>
+                    <TableHead>Marcações</TableHead>
+                    <TableHead className="text-right">Total</TableHead>
+                    <TableHead className="w-[1%]"></TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {byDay.map((row) => (
+                    <TableRow key={row.day}>
+                      <TableCell className="font-medium">{row.day}</TableCell>
+                      <TableCell>
+                        <div className="flex flex-wrap gap-2">
+                          {row.ps.map((p) => (
+                            <span key={p.id} className="px-2 py-1 rounded-full text-xs border">
+                              {p.type === "IN" ? "Entrada" : "Saída"} • {fmtTime(p.ts)}
+                            </span>
+                          ))}
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-right font-semibold">{msToHHMM(row.totalMs)}</TableCell>
+                      <TableCell className="text-right">
+                        <Button variant="ghost" size="icon" onClick={() => {
+                          if (!confirm("Excluir todas as marcações deste dia?")) return;
+                          const keep = punches.filter((x) => !(x.userId === viewUser.id && yyyyMMdd(x.ts) === row.day));
+                          setPunches(keep);
+                          savePunches(keep);
+                        }}>
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+export default function App() {
+  const [users, setUsers] = useLocalState<User[]>(LS_KEYS.users, loadUsers());
+  const [punches, setPunches] = useLocalState<Punch[]>(LS_KEYS.punches, loadPunches());
+  const [session, setSession] = useState<{ userId: string } | null>(loadSession());
+  const currentUser = users.find((u) => u.id === session?.userId) || null;
+
+  useEffect(() => {
+    saveUsers(users);
+  }, [users]);
+
+  useEffect(() => {
+    savePunches(punches);
+  }, [punches]);
+
+  function handleLogin(u: User) {
+    const s = { userId: u.id };
+    setSession(s);
+    saveSession(s);
+  }
+
+  function handleLogout() {
+    setSession(null);
+    saveSession(null);
+  }
+
+  if (!currentUser) {
+    return <AuthView onLogin={handleLogin} />;
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50">
+      <HeaderBar currentUser={currentUser} onLogout={handleLogout} />
+      <main className="max-w-6xl mx-auto p-4 md:p-6 space-y-6">
+        <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
+          <Tabs defaultValue="ponto" className="w-full">
+            <TabsList className="grid grid-cols-2 md:w-[420px]">
+              <TabsTrigger value="ponto">Bater Ponto</TabsTrigger>
+              <TabsTrigger value="historico">Histórico</TabsTrigger>
+            </TabsList>
+            <div className="mt-4 grid gap-4">
+              <TabsContent value="ponto">
+                <ClockPanel user={currentUser} allPunches={punches} setAllPunches={setPunches} />
+              </TabsContent>
+              <TabsContent value="historico">
+                <HistoryPanel user={currentUser} allPunches={punches} />
+              </TabsContent>
+            </div>
+          </Tabs>
+        </motion.div>
+
+        {currentUser.role === "admin" && (
+          <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3, delay: 0.05 }}>
+            <AdminPanel currentUser={currentUser} users={users} setUsers={setUsers} punches={punches} setPunches={setPunches} />
+          </motion.div>
+        )}
+      </main>
+      <footer className="max-w-6xl mx-auto px-4 pb-10 text-xs text-slate-500">
+        <Separator className="my-6" />
+        <p>
+          Protótipo local-first (sem servidor). Em produção, conecte a Firebase Auth/Firestore ou Supabase.
+        </p>
+      </footer>
+    </div>
+  );
+}
